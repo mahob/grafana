@@ -48,8 +48,21 @@ type UsageStatsService struct {
 	concurrentUserStatsCache memoConcurrentUserStats
 }
 
+func ProvideService(cfg *setting.Cfg, bus bus.Bus, sqlStore *sqlstore.SQLStore,
+	alertingStats alerting.UsageStatsQuerier, licensing models.Licensing, pluginManager plugins.Manager) *UsageStatsService {
+	oauthProviders := social.GetOAuthProviders(cfg)
+	return &UsageStatsService{
+		Cfg:                cfg,
+		Bus:                bus,
+		SQLStore:           sqlStore,
+		AlertingUsageStats: alertingStats,
+		License:            licensing,
+		oauthProviders:     oauthProviders,
+		PluginManager:      pluginManager,
+	}
+}
+
 func (uss *UsageStatsService) Init() error {
-	uss.oauthProviders = social.GetOAuthProviders(uss.Cfg)
 	return nil
 }
 
