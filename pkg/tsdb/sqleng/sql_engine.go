@@ -12,7 +12,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/davecgh/go-spew/spew"
+	"github.com/grafana/grafana-plugin-sdk-go/backend"
 	"github.com/grafana/grafana-plugin-sdk-go/data"
 	"github.com/grafana/grafana-plugin-sdk-go/data/sqlutil"
 	"github.com/grafana/grafana/pkg/components/null"
@@ -130,6 +130,31 @@ func NewDataPlugin(config DataPluginConfiguration, queryResultTransformer SqlQue
 
 const rowLimit = 1000000
 
+func getFillMissing(query *plugins.DataSubQuery) (*data.FillMissing, error) {
+	fm := &data.FillMissing{}
+	fillmode, err := query.Model.Get("fillMode").String()
+	if err != nil {
+		return fm, err
+	}
+	switch strings.ToLower(fillmode) {
+	case "null":
+		fm.Mode = data.FillModeNull
+	case "previous":
+		fm.Mode = data.FillModePrevious
+	default:
+		fm.Mode = data.FillModeValue
+	}
+	if fm.Mode != data.FillModeValue {
+		return fm, nil
+	}
+	floatVal, err := query.Model.Get("fillValue").Float64()
+	if err != nil {
+		return fm, err
+	}
+	fm.Value = floatVal
+	return fm, nil
+}
+
 // Query is the main function for the SqlQueryEndpoint
 func (e *dataPlugin) DataQuery(ctx context.Context, dsInfo *models.DataSource,
 	queryContext plugins.DataQuery) (plugins.DataResponse, error) {
@@ -139,7 +164,9 @@ func (e *dataPlugin) DataQuery(ctx context.Context, dsInfo *models.DataSource,
 	}
 	ch := make(chan plugins.DataQueryResult, len(queryContext.Queries))
 	var wg sync.WaitGroup
+
 	// Execute each query in a goroutine and wait for them to finish afterwards
+
 	for _, query := range queryContext.Queries {
 		if query.Model.Get("rawSql").MustString() == "" {
 			continue
@@ -149,7 +176,7 @@ func (e *dataPlugin) DataQuery(ctx context.Context, dsInfo *models.DataSource,
 
 		go func(query plugins.DataSubQuery) {
 			defer wg.Done()
-
+			frames := data.Frames{}
 			queryResult := plugins.DataQueryResult{
 				Meta:  simplejson.New(),
 				RefID: query.RefID,
@@ -193,22 +220,62 @@ func (e *dataPlugin) DataQuery(ctx context.Context, dsInfo *models.DataSource,
 				}
 			}()
 
-			format := query.Model.Get("format").MustString("time_series")
-
-			switch format {
-			case "time_series":
-				err := e.transformToTimeSeries(query, rows, &queryResult, queryContext)
-				if err != nil {
-					queryResult.Error = err
-					return
-				}
-			case "table":
-				err := e.transformToTable(query, rows, &queryResult, queryContext)
-				if err != nil {
-					queryResult.Error = err
-					return
-				}
+			// Convert row.Rows to dataframe
+			myCs := e.queryResultTransformer.GetConverterList()
+			frame, _, err := sqlutil.FrameFromRows(rows.Rows, rowLimit, myCs...)
+			if err != nil {
+				queryResult.Error = err
+				return
 			}
+			frame.SetMeta(&data.FrameMeta{
+				ExecutedQueryString: rawSQL,
+			})
+
+			// If no rows were returned, no point checking anything else.
+			if frame.Rows() == 0 {
+				return
+			}
+			// frame, foo, err := sqlutil.FrameFromRows(rows.Rows, rowLimit, myCs...)
+
+			tsSchema := frame.TimeSeriesSchema()
+			backend.Logger.Debug("Timeseries schema", "schema", tsSchema.Type)
+
+			format := query.Model.Get("format").MustString("time_series")
+			fillMissing, _ := getFillMissing(&query) //query.Model.Get("fill").MustBool(false)
+
+			if format == "time_series" && tsSchema.Type == data.TimeSeriesTypeLong {
+				var err error
+				// wideFrame, err := data.LongToWide(frame, fillMissing)
+				_, err = data.LongToWide(frame, fillMissing)
+				if err != nil {
+					queryResult.Error = fmt.Errorf("Failed to convert long to wide series when converting from dataframe %v", err)
+					return
+				}
+				// frame, err = resample(wideFrame, qm)
+
+				// if err != nil {
+				// 	backend.Logger.Debug("Failed to resample dataframe", "err", err)
+				// 	frame.AppendNotices(data.Notice{Text: "Failed to resample dataframe", Severity: data.NoticeSeverityWarning})
+				// }
+				// err = trim(frame, qm)
+				// if err != nil {
+				// 	backend.Logger.Debug("Failed to resample dataframe", "err", err)
+				// 	frame.AppendNotices(data.Notice{Text: "Failed to resample dataframe", Severity: data.NoticeSeverityWarning})
+				// }
+			}
+			// switch format {
+			// case "time_series":
+			// 	err := e.transformToTimeSeries(query, rows, &queryResult, queryContext)
+			// 	if err != nil {
+			// 		queryResult.Error = err
+			// 		return
+			// 	}
+			// case "table":
+			// 	fmt.Print("going to table")
+			// }
+
+			frames = append(frames, frame)
+			queryResult.Dataframes = plugins.NewDecodedDataFrames(frames)
 
 			ch <- queryResult
 		}(query)
@@ -248,16 +315,17 @@ func (e *dataPlugin) transformToTable(query plugins.DataSubQuery, rows *core.Row
 	result *plugins.DataQueryResult, queryContext plugins.DataQuery) error {
 	frames := data.Frames{}
 	myCs := e.queryResultTransformer.GetConverterList()
-	frame, foo, err := sqlutil.FrameFromRows(rows.Rows, rowLimit, myCs...)
+	frame, _, err := sqlutil.FrameFromRows(rows.Rows, rowLimit, myCs...)
+	// frame, foo, err := sqlutil.FrameFromRows(rows.Rows, rowLimit, myCs...)
 
 	if err != nil {
 		return err
 	}
 	frames = append(frames, frame)
 	result.Dataframes = plugins.NewDecodedDataFrames(frames)
-	content, _ := frame.StringTable(-1, -1)
-	spew.Dump(foo)
-	fmt.Println("<<<<<<<<<<<<<<<<<<<<<<<<<<", content)
+	// content, _ := frame.StringTable(-1, -1)
+	// spew.Dump(foo)
+	// fmt.Println("<<<<<<<<<<<<<<<<<<<<<<<<<<", content)
 	return nil
 }
 
@@ -286,11 +354,15 @@ func newProcessCfg(query plugins.DataSubQuery, queryContext plugins.DataQuery, r
 		pointsBySeries:     make(map[string]*plugins.DataTimeSeries),
 		queryContext:       queryContext,
 	}
+
 	return cfg, nil
 }
 
 func (e *dataPlugin) transformToTimeSeries(query plugins.DataSubQuery, rows *core.Rows,
 	result *plugins.DataQueryResult, queryContext plugins.DataQuery) error {
+
+	// the only difference between table and timeseries is that for timeserie we need to manage intervals
+
 	cfg, err := newProcessCfg(query, queryContext, rows)
 	if err != nil {
 		return err
@@ -399,6 +471,25 @@ type processCfg struct {
 	queryContext       plugins.DataQuery
 	fillInterval       float64
 	fillPrevious       bool
+}
+
+// DataQueryFormat is the type of query.
+type DataQueryFormat string
+
+const (
+	// DataQueryFormatTable identifies a table query (default).
+	DataQueryFormatTable DataQueryFormat = "table"
+	// DataQueryFormatSeries identifies a time series query.
+	DataQueryFormatSeries DataQueryFormat = "time_series"
+)
+
+type DataQueryModel struct {
+	PreInterpolatedQuery string
+	InterpolatedQuery    string // property non set until after Interpolate()
+	Format               DataQueryFormat
+	TimeRange            backend.TimeRange
+	FillMissing          *data.FillMissing // property non set until after Interpolate()
+	Interval             time.Duration
 }
 
 func (e *dataPlugin) processRow(cfg *processCfg) error {
